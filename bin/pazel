@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+'''Python tool to plot azimuth and elevation of astronomical objects.'''
+
+# the standard library
+import os
+import sys
+import time
+import json
+import curses
+import argparse
+from collections import OrderedDict
+from urllib2 import urlopen, URLError
+from datetime import datetime, timedelta
+
+# dependent packages
+import ephem
+import numpy as np
+import matplotlib.pyplot as plt
+
+# optional packages
+try:
+    import seaborn as sns
+    sns.set_context('poster')
+    sns.set_palette('Set2', 10)
+except ImportError:
+    print('WARN: seaborn is not installed')
+
+# constants
+NOW = datetime.now().strftime('%Y-%m-%d')
+
+
+def get_locinfo(location, date):
+    info = OrderedDict()
+    api_gm = 'https://maps.googleapis.com/maps/api'
+    url_gc = api_gm + '/geocode/json?address={}'
+    url_tz = api_gm + '/timezone/json?location={},{}&timestamp={}'
+
+    gc = json.load(urlopen(url_gc.format(location)))['results'][0]
+    info['name'] = gc['address_components'][0]['long_name']
+    info['address'] = gc['formatted_address']
+    info['place_id'] = gc['place_id']
+    info['lat'] = gc['geometry']['location']['lat']
+    info['lng'] = gc['geometry']['location']['lng']
+
+    t_unix = (date - datetime(1970, 1, 1)).total_seconds()
+    tz = json.load(urlopen(url_tz.format(info['lat'], info['lng'], t_unix)))
+    info['tz_name'] = tz['timeZoneName']
+    info['tz_value'] = (tz['rawOffset']+tz['dstOffset']) / 3600.0
+    return info
+
+
+def get_objbody(obj):
+    try:
+        body = getattr(ephem, str(obj))()
+    except AttributeError:
+        body = ephem.FixedBody()
+        body._ra = ephem.hours(str(obj['ra']))
+        body._dec = ephem.degrees(str(obj['dec']))
+        try:
+            body._epoch = getattr(ephem, obj['epoch'])
+        except AttributeError:
+            body._epoch = ephem.J2000
+
+    return body
+
+
+def get_azel_day(obj, loc_info, tz_info):
+    body = get_objbody(obj)
+    obsv = ephem.Observer()
+    obsv.date = ephem.Date(loc_info['date'])
+    obsv.lat = str(loc_info['lat'])
+    obsv.lon = str(loc_info['lng'])
+
+    if tz_info['tz_value'] == 'lst':
+        obsv.date -= obsv.sidereal_time() / (2.0*np.pi)
+    else:
+        obsv.date -= tz_info['tz_value'] * ephem.hour
+
+    t = np.arange(0.0, 24.0+0.01, 0.01)
+    az, el = np.zeros_like(t), np.zeros_like(t)
+    for i in range(len(t)):
+        body.compute(obsv)
+        az[i], el[i] = np.rad2deg([body.az, body.alt])
+        obsv.date += 0.01 * ephem.hour
+
+    ma_az, ma_el = np.hstack([np.abs(np.diff(az))>180.0, False]), el<0.0
+    az, el = np.ma.array(az, mask=ma_az|ma_el), np.ma.array(el, mask=ma_el)
+    return t, az, el
+
+
+def get_azel_now(obj, loc_info):
+    body = get_objbody(obj)
+    obsv = ephem.Observer()
+    obsv.date = ephem.now()
+    obsv.lat = str(loc_info['lat'])
+    obsv.lon = str(loc_info['lng'])
+    lst = str(obsv.sidereal_time())
+    lst = datetime.strptime(lst, '%H:%M:%S.%f')
+    body.compute(obsv)
+
+    keys = ['ra', 'dec', 'az', 'el', 'lst']
+    vals = map(str, [body.ra, body.dec, body.az, body.alt]) + [lst]
+    return {key: val for key, val in zip(keys, vals)}
+
+
+if __name__ == '__main__':
+    # help document
+    help_m = '''
+        plot mode. options: show (-> plt.show), save (-> plt.savefig), and list (list
+        az, el on a terminal in real time). default: %(default)s.'''
+    help_l = '''
+        observation\'s location in free format that can be searchable in Google Maps.
+        example: -l San Pedro de Atacama. default: %(default)s.'''
+    help_d = '''
+        observation\'s date. default: %(default)s (today).'''
+    help_o = '''
+        a JSON format file describing astronomical objects. default: %(default)s.'''
+    help_tz = '''
+        for show and save mode - timezone of x axis. options: LT (Local Time), UTC
+        (Universal Coordinated Time), LST (Local Sidereal Time), and timezone\'s
+        location in free format that can be searchable in Google Maps. example: --tz
+        Japan (to plot in JST). default: %(default)s.'''
+    help_ext = '''
+        for save mode - file extension in save mode. options: pdf, png, eps, etc
+        which are available in matplotlib. default: %(default)s.'''
+    help_lim = '''
+        for list mode - upper and lower El limits for notification. when El of the
+        objects whose name begin with '!' is out of the range, the value blinks and
+        a bell rings (if --bell option is spacified). example: 30:80 (tol. range =
+        30 deg < El < 80 deg), 30: (tol. range = 30 deg < El). default: %(default)s
+        (no limits).'''
+    help_bell = '''
+        for list mode - ring a bell when El of the objects whose name begin with '!'
+        is out of the range. default: %(default)s.'''
+
+    # argument parser
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('-m', help=help_m, metavar='plot mode', type=str.lower, default='show')
+    p.add_argument('-l', help=help_l, metavar='kwd', nargs='*', default=['Tokyo'])
+    p.add_argument('-d', help=help_d, metavar='YYYY-MM-DD', default=NOW)
+    p.add_argument('-o', help=help_o, metavar='JSON file', default='solar_objects.json')
+    p.add_argument('--tz', help=help_tz, metavar='kwd', nargs='*', default=['LT'])
+    p.add_argument('--ext', help=help_ext, metavar='extension', type=str.lower, default='pdf')
+    p.add_argument('--lim', help=help_lim, metavar='lower:upper', default=':')
+    p.add_argument('--bell', help=help_bell, action='store_true', default=False)
+    args = p.parse_args()
+
+    # create known_locations.json if it dosn't exist
+    if not 'known_locations.json' in os.listdir('.'):
+        with open('known_locations.json', 'w') as f:
+            f.write(json.dumps({}))
+
+    # load and update known_locations.json
+    with open('known_locations.json', 'r+') as f:
+        locs = json.load(f, object_pairs_hook=OrderedDict)
+        date = datetime.strptime(args.d, '%Y-%m-%d')
+        pids = [val['place_id'] for val in locs.values()]
+
+        key = '+'.join(args.l).lower()
+        if key in locs:
+            try:
+                name = '+'.join(locs[key]['name'].split())
+                loc_info = get_locinfo(name, date)
+                locs.update({key: loc_info})
+            except URLError:
+                loc_info = locs[key]
+        else:
+            try:
+                loc_info = get_locinfo(key, date)
+            except URLError:
+                print('ERROR: no internet connection!')
+                sys.exit()
+
+            if loc_info['place_id'] in pids:
+                print('WARN: same location is already stored')
+            else:
+                locs.update({key: loc_info})
+
+        key = '+'.join(args.tz).lower()
+        if key == 'utc':
+            tz_info = {'tz_name': 'UTC', 'tz_value': 0.0}
+        elif key == 'lst':
+            tz_info = {'tz_name': 'LST', 'tz_value': 'lst'}
+        elif key == 'lt':
+            tz_info = loc_info
+        elif key in locs:
+            try:
+                name = '+'.join(locs[key]['name'].split())
+                tz_info = get_locinfo(name, date)
+                locs.update({key: tz_info})
+            except URLError:
+                tz_info = locs[key]
+        else:
+            try:
+                tz_info = get_loc_info(key, date)
+            except URLError:
+                print('ERROR: no internet connection!')
+                sys.exit()
+
+            if tz_info['place_id'] in pids:
+                print('WARN: same location is already stored')
+            else:
+                locs.update({key: tz_info})
+
+        f.seek(0)
+        f.write(json.dumps(locs, indent=4))
+        f.truncate()
+        loc_info['date'] = date
+
+    # load an JSON file of objects
+    with open(args.o) as f:
+        objs = json.load(f, object_pairs_hook=OrderedDict)
+
+    # plot/save mode
+    if args.m in ['show', 'save']:
+        # print screen
+        hline = '+' + '-'*76 + '+'
+        str_name = u'{name}'.format(**loc_info)
+        str_address = u'{address}'.format(**loc_info)
+        if len(str_address) > 40:
+            str_address = str_address[:36]+' ...'
+
+        str_latlng = u'{lat}, {lng}'.format(**loc_info)
+        str_timezone = u'{tz_name} (UTC{tz_value:+.1f})'.format(**loc_info)
+        fmt_loc = '|{:^16}|    {:<8}    {:<43}|'
+        print(hline)
+        print('|{:^76}|'.format('Pazel\'s show/save mode'))
+        print(hline)
+        print(fmt_loc.format('', 'name', str_name))
+        print(fmt_loc.format('Observer', 'address', str_address))
+        print(fmt_loc.format('Location', 'lat, lng', str_latlng))
+        print(fmt_loc.format('', 'timezone', str_timezone))
+        print(hline)
+
+        # figure settings
+        fig = plt.figure()
+        fig.subplots_adjust(0.1, 0.1, 0.9, 0.9, 0.1, 0.25)
+        ax_azl = fig.add_subplot(211)
+        ax_azl.set_xlim([0, 24])
+        ax_azl.set_ylim([0, 360])
+        ax_azl.set_xticks(np.arange(24+1))
+        ax_azl.set_yticks(np.arange(0, 360+1, 45))
+        ax_azl.tick_params(labelbottom='off')
+        ax_azl.set_title(u'{name} / {date:%Y-%m-%d}'.format(**loc_info))
+        ax_azl.set_ylabel('Azimuth (deg)')
+        ax_ell = fig.add_subplot(212, sharex=ax_azl)
+        ax_ell.set_xlim([0, 24])
+        ax_ell.set_ylim([0, 90])
+        ax_ell.set_xticks(np.arange(24+1))
+        ax_ell.set_yticks(np.arange(0, 90+1, 10))
+        ax_ell.set_xlabel('{tz_name} (hr)'.format(**tz_info))
+        ax_ell.set_ylabel('Elevation (deg)')
+        ax_azr = ax_azl.twinx()
+        ax_azr.set_yticks(np.arange(0, 360+1, 45))
+        ax_azr.set_yticklabels(['N','','E','','S','','W','','N'])
+        ax_azr.grid(False)
+        ax_elr = ax_ell.twinx()
+        ax_elr.set_yticks(np.arange(0, 90+1, 30))
+        ax_elr.grid(False)
+
+        # plot az, el of objects
+        for (key, obj) in objs.items():
+            if key[0] == '#': continue
+            t, az, el = get_azel_day(obj, loc_info, tz_info)
+            ax_azl.plot(t, az, label=key)
+            ax_ell.plot(t, el, label=key)
+
+        ax_ell.legend(loc=10, ncol=4, mode='expand',
+            frameon=False, bbox_to_anchor=(0.0, 0.625, 1.0, 1.0))
+
+        # show or save
+        if args.m == 'show':
+            plt.show()
+        elif args.m == 'save':
+            plt.savefig('plot.{}'.format(args.ext))
+
+    # list mode
+    elif args.m == 'list':
+        # el limits if spacified
+        lower, upper = args.lim.split(':')
+        lower = float(lower) if not lower == '' else 0.0
+        upper = float(upper) if not upper == '' else 90.0
+
+        def refresh():
+            hline = '+' + '-'*76 + '+'
+            # objects
+            fmt_objs = '|{:^16}|   {:>11}   {:>11}   {:>11}   {:>11}   |'
+            scr.addstr(11, 0, hline)
+            scr.addstr(12, 0, fmt_objs.format('Object', 'RA', 'Dec', 'Az', 'El'))
+            scr.addstr(13, 0, hline)
+            row = 14
+            for (key, obj) in objs.items():
+                if key[0] == '#': continue
+                d = get_azel_now(obj, loc_info)
+                scr.addstr(row, 0, fmt_objs.format(key, d['ra'], d['dec'], d['az'], d['el']))
+                if not lower <= np.rad2deg(ephem.degrees(d['el'])) <= upper:
+                    if key[0] == '!':
+                        scr.addstr(row, 63, u'{:>11}'.format(d['el']), curses.A_BLINK)
+                        print('\a' * args.bell)
+                row += 1
+            # title
+            scr.addstr(0, 0, hline)
+            scr.addstr(1, 0, '|{:^76}|'.format('Pazel\'s list mode'))
+            # location
+            str_name = u'{name}'.format(**loc_info)
+            str_address = u'{address}'.format(**loc_info)
+            if len(str_address) > 40:
+                str_address = str_address[:36]+' ...'
+
+            str_latlng = u'{lat}, {lng}'.format(**loc_info)
+            str_timezone = u'{tz_name} (UTC{tz_value:+.1f})'.format(**loc_info)
+            fmt_loc = '|{:^16}|    {:<8}    {:<43}|'
+            scr.addstr(2, 0, hline)
+            scr.addstr(3, 0, fmt_loc.format('', 'name', str_name))
+            scr.addstr(4, 0, fmt_loc.format('Observer', 'address', str_address))
+            scr.addstr(5, 0, fmt_loc.format('Location', 'lat, lng', str_latlng))
+            scr.addstr(6, 0, fmt_loc.format('', 'timezone', str_timezone))
+            # time
+            utc = datetime.utcnow()
+            lt = utc + timedelta(hours=loc_info['tz_value'])
+            str_lt  = 'LT {:%H:%M:%S}'.format(lt)
+            str_utc = 'UTC {:%H:%M:%S}'.format(utc)
+            str_lst = 'LST {:%H:%M:%S}'.format(d['lst'])
+            fmt_time = '|{:^16}|{:^19}|{:^19}|{:^19}|'
+            scr.addstr(7, 0, hline)
+            scr.addstr(8, 0, fmt_time.format('','','',''))
+            scr.addstr(9, 0, fmt_time.format('Time', str_lt, str_utc, str_lst))
+            scr.addstr(10, 0, fmt_time.format('','','',''))
+            # finally
+            scr.addstr(row, 0, hline)
+            scr.refresh()
+
+        # run screen
+        scr = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        try:
+            while True:
+                refresh()
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            curses.echo()
+            curses.nocbreak()
+            curses.endwin()
