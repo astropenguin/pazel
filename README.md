@@ -1,7 +1,8 @@
 # Pazel
 
 :warning: Python tool to plot azimuth and elevation of astronomical objects
-This project is discontinued. Please consider to use [Azely](https://github.com/astropenguin/azely).
+
+**This project is discontinued. Please consider to use [Azely (astropenguin/azely)](https://github.com/astropenguin/azely).**
 
 ## About Pazel
 
