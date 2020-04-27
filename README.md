@@ -1,6 +1,7 @@
 # Pazel
 
-:chart_with_upwards_trend: Python tool to plot azimuth and elevation of astronomical objects
+:warning: Python tool to plot azimuth and elevation of astronomical objects
+This project is discontinued. Please consider to use [Azely](https://github.com/astropenguin/azely).
 
 ## About Pazel
 
